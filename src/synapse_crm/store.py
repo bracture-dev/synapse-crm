@@ -3,6 +3,7 @@
 import json
 import os
 import re
+from collections.abc import Collection
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +21,8 @@ _ENTITIES = {
 _IMMUTABLE = {"id", "type", "version", "created_at", "created_by"}
 _BASE_SCHEMA_REF = "https://upjack.dev/schemas/v1/upjack-entity.schema.json"
 _INDEX = "apps/crm/data/_index/relations.json"
+_EXTENSIONS = "apps/crm/schemas/{kind}.fields.json"
+_FIELD_TYPES = ("array", "boolean", "integer", "number", "object", "string")
 
 
 def _now_iso() -> str:
@@ -69,7 +72,31 @@ def _kind(entity_id: str) -> str:
     raise ValueError("Unknown entity ID prefix")
 
 
-def _load_schema(schemas: Path, kind: str) -> dict[str, Any]:
+def _field_error(reserved: Collection[str], name: str, field: Any) -> str | None:
+    """Say why a field cannot be added, in Upjack's add_field words and order."""
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
+        return f"Invalid field_name '{name}'. Must match [a-z][a-z0-9_]*"
+    if name in reserved:
+        return f"Field '{name}' is a reserved base entity field"
+    if (
+        not isinstance(field, dict)
+        or set(field) - {"description"} != {"type", "default", "required"}
+        or not isinstance(field["required"], bool)
+        or not isinstance(field.get("description", ""), str)
+    ):
+        return f"Invalid definition for field '{name}'"
+    if field["type"] not in _FIELD_TYPES:
+        return f"Invalid field_type '{field['type']}'. Allowed: {list(_FIELD_TYPES)}"
+    # Records are validated with JSON Schema, where True is not an integer.
+    if not Draft202012Validator({"type": field["type"]}).is_valid(field["default"]):
+        return (
+            f"Default value {field['default']!r} is not compatible with type "
+            f"'{field['type']}'"
+        )
+    return None
+
+
+def _load_schema(schemas: Path, kind: str, fields: dict[str, Any]) -> dict[str, Any]:
     schema = json.loads((schemas / f"{kind}.schema.json").read_text())
     base = json.loads((schemas / "entity.schema.json").read_text())
     # Swap the local base record schema in for the remote $ref only.
@@ -79,6 +106,20 @@ def _load_schema(schemas: Path, kind: str) -> dict[str, Any]:
         else part
         for part in schema.get("allOf", [])
     ]
+    for name, field in fields.items():
+        # A field the app or the base record schema now defines keeps that
+        # definition, so an app update that ships the same name still loads.
+        if name in schema["properties"] or name in base["properties"]:
+            continue
+        error = _field_error(base["properties"], name, field)
+        if error:
+            relative = _EXTENSIONS.format(kind=kind)
+            raise ValueError(f"Invalid field in {relative}: {error}")
+        schema["properties"][name] = {
+            key: value for key, value in field.items() if key != "required"
+        }
+        if field["required"]:
+            schema.setdefault("required", []).append(name)
     return schema
 
 
@@ -86,16 +127,22 @@ class CRMStore:
     """CRM records stored as one JSON file each under the workspace root."""
 
     def __init__(self, root: str | Path, project_root: str | Path) -> None:
-        """Load the entity schemas.
+        """Load the entity schemas, with any fields added in the workspace.
 
         Args:
-            root: Workspace root that holds ``apps/crm/data``.
+            root: Workspace root that holds ``apps/crm/data`` and
+                ``apps/crm/schemas``.
             project_root: Repository root that holds ``schemas``.
         """
         self.root = Path(root).resolve()
         self._lock = RLock()
-        schemas = Path(project_root).resolve() / "schemas"
-        self._schemas = {kind: _load_schema(schemas, kind) for kind in _ENTITIES}
+        self._schema_dir = Path(project_root).resolve() / "schemas"
+        base = json.loads((self._schema_dir / "entity.schema.json").read_text())
+        self._reserved = set(base["properties"])
+        self._schemas = {
+            kind: _load_schema(self._schema_dir, kind, self._read_extensions(kind))
+            for kind in _ENTITIES
+        }
 
     def _path(self, relative: str) -> Path:
         path = self.root / relative
@@ -108,6 +155,28 @@ class CRMStore:
         if not re.fullmatch(prefix + r"_[0-9A-HJKMNP-TV-Z]{26}", entity_id):
             raise ValueError(f"Invalid {kind} ID")
         return self._path(f"apps/crm/data/{plural}/{entity_id}.json")
+
+    def _read_extensions(self, kind: str) -> dict[str, Any]:
+        """Read the fields ``add_field`` saved in the workspace for one kind."""
+        relative = _EXTENSIONS.format(kind=kind)
+        path = self._path(relative)
+        try:
+            document = json.loads(path.read_text())
+        except FileNotFoundError:
+            return {}
+        except ValueError as error:
+            # Also catches UnicodeDecodeError, for bytes that are not UTF-8.
+            raise ValueError(f"Invalid JSON in {relative}: {error}") from None
+        # Python counts True and 1.0 as equal to 1; add_field writes neither.
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"version", "fields"}
+            or type(document["version"]) is not int
+            or document["version"] != 1
+            or not isinstance(document["fields"], dict)
+        ):
+            raise ValueError(f"Unsupported version or layout in {relative}")
+        return document["fields"]
 
     @staticmethod
     def _atomic(path: Path, value: Any) -> None:
@@ -444,3 +513,74 @@ class CRMStore:
             reverse = self._reverse()
             self._atomic(self._path(_INDEX), {"reverse": reverse})
             return {"success": True, "entries": sum(map(len, reverse.values()))}
+
+    def add_field(
+        self,
+        entity_type: str,
+        field_name: str,
+        field_type: str,
+        default: Any,
+        description: str = "",
+        required: bool = True,
+    ) -> dict[str, Any]:
+        """Add a field to one kind's schema, stored in the workspace.
+
+        Takes the arguments of Upjack's ``add_field`` tool and runs its checks
+        in the same order, but checks a default with the JSON Schema type rules
+        that validate records. Writes
+        ``apps/crm/schemas/<entity_type>.fields.json`` in the workspace and
+        leaves the app's own schemas unchanged.
+
+        Args:
+            entity_type: One of contact, deal or interaction.
+            field_name: Lowercase name that no base record field uses.
+            field_type: array, boolean, integer, number, object or string.
+            default: Value that records without the field read, and that new
+                records get.
+            description: Stored with the field when not empty.
+            required: Whether every saved record must have the field.
+
+        Returns:
+            ``{"success": True, "entity_type": ..., "field": ...}``, or
+            ``{"error": ...}`` with nothing written.
+        """
+        field = {"type": field_type, "default": deepcopy(default), "required": required}
+        if description:
+            field["description"] = description
+        # Upjack checks the field before the kind; every kind reserves the same
+        # base record fields.
+        error = _field_error(self._reserved, field_name, field)
+        if error is None and entity_type not in _ENTITIES:
+            error = f"Unknown entity type '{entity_type}'"
+        if error:
+            return {"error": error}
+        with self._lock:
+            # Check against the saved file, which also holds fields that another
+            # store on this workspace added after this one loaded.
+            fields = self._read_extensions(entity_type)
+            current = _load_schema(self._schema_dir, entity_type, fields)
+            existing = current["properties"].get(field_name)
+            if existing is not None:
+                if existing.get("type") and existing["type"] != field_type:
+                    return {
+                        "error": f"Field '{field_name}' already exists with type "
+                        f"'{existing['type']}'"
+                    }
+                return {"error": f"Field '{field_name}' already exists"}
+            fields[field_name] = field
+            schema = _load_schema(self._schema_dir, entity_type, fields)
+            self._atomic(
+                self._path(_EXTENSIONS.format(kind=entity_type)),
+                {"version": 1, "fields": fields},
+            )
+            self._schemas[entity_type] = schema
+        return {
+            "success": True,
+            "entity_type": entity_type,
+            "field": {
+                "name": field_name,
+                "type": field_type,
+                "default": default,
+                "required": required,
+            },
+        }

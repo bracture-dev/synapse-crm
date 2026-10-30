@@ -264,3 +264,121 @@ def test_relationship_reads_reject_invalid_ids(tmp_path):
                 store.get_related(invalid, direction=direction)
     with pytest.raises(ValueError):
         store.get_related("dl_" + "0" * 26, direction="sideways")
+
+
+REGION = {"type": "string", "default": "west", "required": True}
+FIELDS = "apps/crm/schemas/contact.fields.json"
+
+
+def test_added_field_lives_in_the_workspace_and_fills_older_records(tmp_path):
+    installed = {path: path.read_bytes() for path in (ROOT / "schemas").iterdir()}
+    store = CRMStore(tmp_path, ROOT)
+    loaded_before = CRMStore(tmp_path, ROOT)
+    older = store.create_entity("contact", {"name": "Older contact"})
+    assert store.add_field("contact", "region", "string", "west", "Sales region") == {
+        "success": True,
+        "entity_type": "contact",
+        "field": {"name": "region", **REGION},
+    }
+    assert store.add_field("contact", "tier", "string", "", required=False)["success"]
+    assert {path: path.read_bytes() for path in installed} == installed
+    assert store.get_entity("contact", older["id"])["region"] == "west"
+    saved = (tmp_path / FIELDS).read_bytes()
+    assert json.loads(saved) == {
+        "version": 1,
+        "fields": {
+            "region": {**REGION, "description": "Sales region"},
+            "tier": {"type": "string", "default": "", "required": False},
+        },
+    }
+    restarted = CRMStore(tmp_path, ROOT)
+    required = restarted._schemas["contact"]["required"]
+    assert "region" in required
+    assert "tier" not in required
+    assert restarted.get_entity("contact", older["id"])["region"] == "west"
+    created = restarted.create_entity("contact", {"name": "New contact"})
+    assert created["region"] == "west"
+    updated = restarted.update_entity("contact", older["id"], {"region": "east"})
+    assert updated["region"] == "east"
+    with pytest.raises(ValidationError):
+        restarted.update_entity("contact", older["id"], {"region": 7})
+    assert loaded_before.add_field("contact", "region", "integer", 0) == {
+        "error": "Field 'region' already exists with type 'string'"
+    }
+    assert (tmp_path / FIELDS).read_bytes() == saved
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error"),
+    [
+        (("company", "region", "string", ""), "Unknown entity type 'company'"),
+        (
+            ("contact", "Region", "string", ""),
+            "Invalid field_name 'Region'. Must match [a-z][a-z0-9_]*",
+        ),
+        (
+            ("company", "Region", "string", ""),
+            "Invalid field_name 'Region'. Must match [a-z][a-z0-9_]*",
+        ),
+        (("contact", "id", "string", ""), "Field 'id' is a reserved base entity field"),
+        (
+            ("contact", "region", "date", ""),
+            "Invalid field_type 'date'. Allowed: "
+            "['array', 'boolean', 'integer', 'number', 'object', 'string']",
+        ),
+        (
+            ("contact", "score", "integer", "high"),
+            "Default value 'high' is not compatible with type 'integer'",
+        ),
+        (
+            ("contact", "score", "integer", True),
+            "Default value True is not compatible with type 'integer'",
+        ),
+        (
+            ("contact", "score", "number", True),
+            "Default value True is not compatible with type 'number'",
+        ),
+        (("contact", "email", "string", ""), "Field 'email' already exists"),
+    ],
+)
+def test_rejected_fields_write_nothing(tmp_path, arguments, error):
+    store = CRMStore(tmp_path, ROOT)
+    assert store.add_field(*arguments) == {"error": error}
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_a_field_the_app_later_ships_keeps_the_app_definition(tmp_path):
+    path = tmp_path / FIELDS
+    path.parent.mkdir(parents=True)
+    shipped = {"type": "integer", "default": 0, "required": True}
+    fields = {"email": shipped, "tags": shipped, "region": REGION}
+    path.write_text(json.dumps({"version": 1, "fields": fields}))
+    contact = CRMStore(tmp_path, ROOT).create_entity("contact", {"name": "Example"})
+    assert "email" not in contact
+    assert contact["tags"] == []
+    assert contact["region"] == "west"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"{",
+        b"\xff\xfe",
+        {"version": 2, "fields": {"region": REGION}},
+        {"version": True, "fields": {"region": REGION}},
+        {"version": 1, "fields": {}, "extra": 1},
+        {"version": 1, "fields": []},
+        {"version": 1, "fields": {"region": {**REGION, "default": 7}}},
+        {"version": 1, "fields": {"region": {**REGION, "required": "yes"}}},
+        {"version": 1, "fields": {"region": {**REGION, "description": 7}}},
+        {"version": 1, "fields": {"region": {**REGION, "enum": ["west"]}}},
+    ],
+)
+def test_store_refuses_to_load_an_invalid_fields_file(tmp_path, content):
+    path = tmp_path / FIELDS
+    path.parent.mkdir(parents=True)
+    path.write_bytes(
+        content if isinstance(content, bytes) else json.dumps(content).encode()
+    )
+    with pytest.raises(ValueError, match="contact.fields.json"):
+        CRMStore(tmp_path, ROOT)
