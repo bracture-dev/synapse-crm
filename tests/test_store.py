@@ -3,6 +3,7 @@
 import json
 from copy import deepcopy
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 from jsonschema import ValidationError
@@ -154,3 +155,112 @@ def test_immutable_fields_and_caller_values_are_preserved(tmp_path):
     )
     assert updated["id"] == contact["id"]
     assert updated["created_at"] == contact["created_at"]
+
+
+def _ids(records):
+    return sorted(record["id"] for record in records)
+
+
+def _composite(reader, record):
+    composite = reader.get_composite(record["type"], record["id"])
+    related = composite["_related"]
+    composite["_related"] = {name: _ids(linked) for name, linked in related.items()}
+    return composite
+
+
+def test_relationship_reads_match_upjack(tmp_path, app):
+    store = CRMStore(tmp_path, ROOT)
+    contact = app.create_entity("contact", {"name": "Example contact"})
+    removed = app.create_entity("contact", {"name": "Removed contact"})
+    open_deal, closed_deal, orphan_deal = (
+        app.create_entity(
+            "deal",
+            {"title": title, "relationships": [{"rel": "belongs_to", "target": to}]},
+        )
+        for title, to in [
+            ("Open", contact["id"]),
+            ("Closed", contact["id"]),
+            ("Orphan", removed["id"]),
+        ]
+    )
+    note = log_interaction(app, contact["id"], "note", "Example note")
+    app.delete_entity("deal", closed_deal["id"])
+    app.delete_entity("contact", removed["id"], hard=True)
+
+    linked = store.query_by_relationship("deal", "belongs_to", contact["id"])
+    assert _ids(linked) == [open_deal["id"]]
+    assert linked == app.query_by_relationship("deal", "belongs_to", contact["id"])
+    other = {"title": "Other"}
+    assert store.query_by_relationship("deal", "belongs_to", contact["id"], other) == []
+    reverse = store.get_related(contact["id"], direction="reverse")
+    assert _ids(reverse) == _ids([open_deal, closed_deal, note])
+    assert store.get_related(contact["id"], rel="owns", direction="reverse") == []
+    assert _ids(store.get_related(note["id"], rel="belongs_to")) == [contact["id"]]
+    assert store.get_related(note["id"], rel="owns") == []
+    orphaned = store.get_related(removed["id"], direction="reverse")
+    assert _ids(orphaned) == [orphan_deal["id"]]
+    for record in [contact, open_deal, closed_deal, orphan_deal, note]:
+        for direction in ["forward", "reverse"]:
+            assert _ids(store.get_related(record["id"], direction=direction)) == _ids(
+                app.get_related(record["id"], direction=direction)
+            )
+        assert _composite(store, record) == _composite(app, record)
+
+
+def test_reads_ignore_a_stale_index_and_rebuild_replaces_it(tmp_path):
+    store = CRMStore(tmp_path, ROOT)
+    contact = store.create_entity("contact", {"name": "Example contact"})
+    link = [{"rel": "belongs_to", "target": contact["id"]}]
+    deal = store.create_entity("deal", {"title": "Example", "relationships": link})
+    index = tmp_path / INDEX
+    index.write_text('{"reverse": {}}\n')
+    assert store.get_related(contact["id"], direction="reverse") == [deal]
+    composite = store.get_composite("contact", contact["id"])
+    assert composite["_related"] == {"~belongs_to": [deal]}
+    assert store.get_composite("contact", contact["id"], depth=0)["_related"] == {}
+    assert store.rebuild_index() == {"success": True, "entries": 1}
+    assert json.loads(index.read_text()) == {
+        "reverse": {contact["id"]: [{"source": deal["id"], "rel": "belongs_to"}]}
+    }
+    store.delete_entity("deal", deal["id"], hard=True)
+    assert store.rebuild_index() == {"success": True, "entries": 0}
+
+
+def test_rebuild_cannot_publish_an_index_older_than_a_write(tmp_path, monkeypatch):
+    store = CRMStore(tmp_path, ROOT)
+    contact = store.create_entity("contact", {"name": "Example contact"})
+    scanned, release = Event(), Event()
+    scan = store._reverse
+
+    def paused_scan():
+        reverse = scan()
+        if not scanned.is_set():
+            scanned.set()
+            release.wait(timeout=3)
+        return reverse
+
+    monkeypatch.setattr(store, "_reverse", paused_scan)
+    rebuilder = Thread(target=store.rebuild_index)
+    rebuilder.start()
+    assert scanned.wait(timeout=3)
+    link = [{"rel": "belongs_to", "target": contact["id"]}]
+    data = {"title": "Concurrent", "relationships": link}
+    writer = Thread(target=store.create_entity, args=("deal", data))
+    writer.start()
+    # Give the write time to finish first if the paused rebuild does not block it.
+    writer.join(timeout=0.5)
+    release.set()
+    rebuilder.join(timeout=3)
+    writer.join(timeout=3)
+    reverse = json.loads((tmp_path / INDEX).read_text())["reverse"]
+    assert [entry["rel"] for entry in reverse.get(contact["id"], [])] == ["belongs_to"]
+
+
+def test_relationship_reads_reject_invalid_ids(tmp_path):
+    store = CRMStore(tmp_path, ROOT)
+    for invalid in ["dl_../../outside", "xx_" + "0" * 26]:
+        for direction in ["forward", "reverse"]:
+            with pytest.raises(ValueError):
+                store.get_related(invalid, direction=direction)
+    with pytest.raises(ValueError):
+        store.get_related("dl_" + "0" * 26, direction="sideways")

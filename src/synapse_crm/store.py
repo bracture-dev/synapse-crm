@@ -62,6 +62,13 @@ def _matches(entity: dict[str, Any], filters: dict[str, Any] | None) -> bool:
     return True
 
 
+def _kind(entity_id: str) -> str:
+    for kind, (_, prefix) in _ENTITIES.items():
+        if entity_id.startswith(prefix + "_"):
+            return kind
+    raise ValueError("Unknown entity ID prefix")
+
+
 def _load_schema(schemas: Path, kind: str) -> dict[str, Any]:
     schema = json.loads((schemas / f"{kind}.schema.json").read_text())
     base = json.loads((schemas / "entity.schema.json").read_text())
@@ -120,8 +127,8 @@ class CRMStore:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def _rebuild_index(self) -> None:
-        """Rewrite Upjack's reverse relationship index from every record file."""
+    def _reverse(self) -> dict[str, list[dict[str, str]]]:
+        """Build Upjack's reverse relationship index from every record file."""
         reverse: dict[str, list[dict[str, str]]] = {}
         for kind in _ENTITIES:
             for record in self._all(kind):
@@ -132,12 +139,19 @@ class CRMStore:
                     sources = reverse.setdefault(link["target"], [])
                     if entry not in sources:
                         sources.append(entry)
-        self._atomic(self._path(_INDEX), {"reverse": reverse})
+        return reverse
+
+    def _find(self, entity_id: str) -> dict[str, Any] | None:
+        try:
+            return self.get_entity(_kind(entity_id), entity_id)
+        except (ValueError, FileNotFoundError):
+            # A link to an unknown ID, or to a record that was hard deleted.
+            return None
 
     def _save(self, kind: str, record: dict[str, Any]) -> dict[str, Any]:
         Draft202012Validator(self._schemas[kind]).validate(record)
         self._atomic(self._entity_path(kind, record["id"]), record)
-        self._rebuild_index()
+        self.rebuild_index()
         return deepcopy(record)
 
     def _hydrate(self, kind: str, record: dict[str, Any]) -> dict[str, Any]:
@@ -268,7 +282,7 @@ class CRMStore:
             record = self.get_entity(kind, entity_id)
             if hard:
                 self._entity_path(kind, entity_id).unlink()
-                self._rebuild_index()
+                self.rebuild_index()
                 return record
             return self.update_entity(kind, entity_id, {"status": "deleted"})
 
@@ -319,3 +333,114 @@ class CRMStore:
 
         ordered = sorted(records, key=sort_key, reverse=sort.startswith("-"))
         return ordered if limit is None else ordered[: max(0, limit)]
+
+    def query_by_relationship(
+        self,
+        kind: str,
+        rel: str,
+        target_id: str,
+        filter: dict[str, Any] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List active records of one kind that link to a target.
+
+        Args:
+            kind: One of contact, deal or interaction.
+            rel: Relationship type, such as ``belongs_to``.
+            target_id: ID of the linked record.
+            filter: Field values or operators, as in ``search_entities``.
+            limit: Maximum number of records, or None for all.
+
+        Returns:
+            The matching records.
+        """
+        records = [
+            record
+            for record in self._all(kind)
+            if record.get("status", "active") == "active"
+            and any(
+                link.get("rel") == rel and link.get("target") == target_id
+                for link in record.get("relationships", [])
+            )
+            and _matches(record, filter)
+        ]
+        return records if limit is None else records[: max(0, limit)]
+
+    def get_related(
+        self, entity_id: str, rel: str | None = None, direction: str = "forward"
+    ) -> list[dict[str, Any]]:
+        """Follow relationship links from a record.
+
+        Args:
+            entity_id: The record ID.
+            rel: Relationship type to follow, or None for all.
+            direction: ``forward`` for the records this one links to, or
+                ``reverse`` for the records that link to it. A reverse lookup
+                still works after the record itself was hard deleted.
+
+        Returns:
+            The linked records. Links to missing records are skipped.
+        """
+        kind = _kind(entity_id)
+        if direction == "forward":
+            ids = [
+                link["target"]
+                for link in self.get_entity(kind, entity_id).get("relationships", [])
+                if link.get("target") and (rel is None or link.get("rel") == rel)
+            ]
+        elif direction == "reverse":
+            # Check the ID even though this lookup never opens its file.
+            self._entity_path(kind, entity_id)
+            ids = [
+                entry["source"]
+                for entry in self._reverse().get(entity_id, [])
+                if rel is None or entry["rel"] == rel
+            ]
+        else:
+            raise ValueError("Direction must be forward or reverse")
+        return [record for record in map(self._find, ids) if record is not None]
+
+    def get_composite(
+        self, kind: str, entity_id: str, depth: int = 1
+    ) -> dict[str, Any]:
+        """Read a record with its linked records under ``_related``.
+
+        Args:
+            kind: One of contact, deal or interaction.
+            entity_id: The record ID.
+            depth: 0 leaves ``_related`` empty. Any higher value follows one
+                hop, as Upjack does.
+
+        Returns:
+            The record, with the records it links to keyed by rel and the
+            records that link to it keyed by ``~rel``.
+        """
+        entity = self.get_entity(kind, entity_id)
+        related: dict[str, list[dict[str, Any]]] = {}
+        if depth >= 1:
+            links = [
+                (link.get("rel"), link.get("target"))
+                for link in entity.get("relationships", [])
+            ] + [
+                ("~" + entry["rel"], entry["source"])
+                for entry in self._reverse().get(entity_id, [])
+            ]
+            for name, other_id in links:
+                other = self._find(other_id) if name and other_id else None
+                if other is not None:
+                    related.setdefault(name, []).append(other)
+        return {**entity, "_related": related}
+
+    def rebuild_index(self) -> dict[str, Any]:
+        """Rewrite Upjack's reverse relationship index from every record file.
+
+        Returns:
+            ``{"success": True, "entries": n}``, as Upjack's ``rebuild_index``
+            tool returns.
+        """
+        # Scan and publish under the write lock, so a rebuild never replaces
+        # an index that a newer write has already published.
+        with self._lock:
+            reverse = self._reverse()
+            self._atomic(self._path(_INDEX), {"reverse": reverse})
+            return {"success": True, "entries": sum(map(len, reverse.values()))}
