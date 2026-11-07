@@ -117,7 +117,9 @@ tool argument schemas include new fields after the server restarts.
 Malformed declarations or a name that collides with a bundled or base field stop
 schema loading; neither side silently overrides the other. To recover, remove or
 rename the entry in `apps/crm/schemas/<kind>.fields.json` and restart. Record
-values stay as they are. Field additions hold an exclusive lock on
+values stay as they are, and renaming does not move them. If the bundled field has
+a different type, change those records' values too, or updates to them fail
+validation. Field additions hold an exclusive lock on
 `<kind>.fields.lock` in the same workspace directory, so two server processes
 sharing one workspace cannot both rewrite the declarations. A competing writer gets an
 error and may retry after the first call finishes. The operating system releases
