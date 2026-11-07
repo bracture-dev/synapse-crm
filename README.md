@@ -115,9 +115,11 @@ memory, and existing record values and metadata are retained. The generated CRUD
 tool argument schemas include new fields after the server restarts.
 
 Malformed declarations or a name that collides with a bundled or base field stop
-schema loading. Reconcile the definitions explicitly before restarting; neither
-side silently overrides the other. Field additions hold an exclusive lock on
-`<kind>.fields.lock` in the same workspace directory. A competing writer gets an
+schema loading; neither side silently overrides the other. To recover, remove or
+rename the entry in `apps/crm/schemas/<kind>.fields.json` and restart. Record
+values stay as they are. Field additions hold an exclusive lock on
+`<kind>.fields.lock` in the same workspace directory, so two server processes
+sharing one workspace cannot both rewrite the declarations. A competing writer gets an
 error and may retry after the first call finishes. The operating system releases
 the lock when its process exits, so a crashed writer leaves nothing to remove.
 
